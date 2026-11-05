@@ -59,6 +59,14 @@ def _emit_event(event_name, **details):
 MUTATOR_MODEL = os.environ.get("IMPROVE_MUTATOR", "gemini-flash-latest")
 EVALUATOR_MODEL = os.environ.get("IMPROVE_EVALUATOR", "gemini-flash-latest")
 
+# Optional OpenAI-compatible backend (e.g. free-agent-hub). When IMPROVE_BASE_URL is
+# set, all model calls go through `{IMPROVE_BASE_URL}/chat/completions` instead of the
+# Google Gemini endpoint. Model names then use the backend's scheme
+# (e.g. "gemini/gemini-3.5-flash"). IMPROVE_API_KEY is the Bearer token the backend
+# expects; when the backend handles its own provider keys it can be any non-empty value.
+BASE_URL = os.environ.get("IMPROVE_BASE_URL", "")
+API_KEY = os.environ.get("IMPROVE_API_KEY", "")
+
 
 def run(cmd, cwd=None):
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=cwd, timeout=60)
@@ -82,8 +90,79 @@ def get_api_key():
     return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 
 
+def _openai_call(prompt, temperature=0.7, max_tokens=8192, max_retries=3):
+    """OpenAI-compatible chat completion (used when IMPROVE_BASE_URL is set)."""
+    import requests
+    key = API_KEY or "hub"
+    url = f"{BASE_URL.rstrip('/')}/chat/completions"
+    body = {
+        "model": os.environ.get("IMPROVE_MUTATOR", "gemini-flash-latest"),
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    headers = {"content-type": "application/json", "authorization": f"Bearer {key}"}
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(url, json=body, headers=headers, timeout=120)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"]
+            elif r.status_code in (429, 503):
+                wait = (attempt + 1) * 15
+                print(f"  API {r.status_code}, retrying in {wait}s (attempt {attempt+1}/{max_retries})", file=sys.stderr)
+                time.sleep(wait)
+            else:
+                print(f"  API error {r.status_code}: {r.text[:200]}", file=sys.stderr)
+                return None
+        except Exception as e:
+            print(f"  API exception: {e}", file=sys.stderr)
+            if attempt < max_retries - 1:
+                time.sleep(10)
+    return None
+
+
+def _openai_json(prompt, max_retries=3):
+    """OpenAI-compatible deterministic (temp=0) JSON call. Returns {} on failure."""
+    import requests
+    key = API_KEY or "hub"
+    url = f"{BASE_URL.rstrip('/')}/chat/completions"
+    body = {
+        "model": os.environ.get("IMPROVE_EVALUATOR", "gemini-flash-latest"),
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+        "max_tokens": 2048,
+    }
+    headers = {"content-type": "application/json", "authorization": f"Bearer {key}"}
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(url, json=body, headers=headers, timeout=120)
+            if r.status_code == 200:
+                text = r.json()["choices"][0]["message"]["content"].strip()
+                if text.startswith("```"):
+                    text = re.sub(r"^```[a-zA-Z0-9]*\s*", "", text)
+                    text = re.sub(r"\s*```\s*$", "", text).strip()
+                try:
+                    return json.loads(text)
+                except Exception:
+                    m = re.search(r"\{.*\}", text, re.DOTALL)
+                    return json.loads(m.group(0)) if m else {}
+            elif r.status_code in (429, 503):
+                time.sleep((attempt + 1) * 15)
+            else:
+                print(f"  API error {r.status_code}: {r.text[:200]}", file=sys.stderr)
+                return {}
+        except Exception as e:
+            print(f"  API exception: {e}", file=sys.stderr)
+            if attempt < max_retries - 1:
+                time.sleep(10)
+    return {}
+
+
 def llm_call(prompt, temperature=0.7, max_retries=3):
-    """Single Gemini API call with retry on 503/429."""
+    """Single model call: Gemini by default, or an OpenAI-compatible backend
+    when IMPROVE_BASE_URL is set."""
+    if BASE_URL:
+        return _openai_call(prompt, temperature, max_retries=max_retries)
     api_key = get_api_key()
     if not api_key:
         print("  No API key found", file=sys.stderr)
@@ -120,10 +199,10 @@ def llm_call(prompt, temperature=0.7, max_retries=3):
 
 
 def _gemini_json(prompt, max_retries=3):
-    """Deterministic Gemini call (temp=0, thinkingBudget=0) returning parsed JSON.
-
-    Used by the pairwise text judge — mirrors eval_voice's call shape. Returns {}
-    on any failure so the gate degrades gracefully (never raises)."""
+    """Deterministic model call: Gemini by default, or OpenAI-compatible backend
+    when IMPROVE_BASE_URL is set. Returns {} on failure."""
+    if BASE_URL:
+        return _openai_json(prompt, max_retries=max_retries)
     api_key = get_api_key()
     if not api_key:
         print("  No API key found", file=sys.stderr)
